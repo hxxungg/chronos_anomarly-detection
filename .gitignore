@@ -1,0 +1,16 @@
+# Python / venv
+.venv/
+__pycache__/
+*.pyc
+
+# Jupyter
+.ipynb_checkpoints/
+
+# 데이터 파일 (실제 공장 데이터 - 저장소에 올리지 않음)
+*.xlsx
+*.xls
+*.csv
+~$*
+
+# 노트북 실행 결과물
+chronos_anomaly_results.csv
