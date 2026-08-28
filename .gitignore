@@ -14,3 +14,8 @@ __pycache__/
 
 # 노트북 실행 결과물
 chronos_anomaly_results.csv
+
+# 파인튜닝 체크포인트 (용량 큼, GitHub 100MB 제한 초과)
+chronos-2-finetuned/
+chronos2_finetuned_2cm/
+*.safetensors
