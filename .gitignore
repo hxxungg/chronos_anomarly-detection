@@ -19,3 +19,4 @@ chronos_anomaly_results.csv
 chronos-2-finetuned/
 chronos2_finetuned_2cm/
 *.safetensors
+chronos_anomaly_results_*.csv
