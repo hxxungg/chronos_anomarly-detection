@@ -17,6 +17,7 @@ from typing import Iterable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
+import torch
 
 
 PROTOCOL_VERSION = "review_v2_process_pred1"
@@ -281,6 +282,94 @@ def chronological_split(
     return tuple(pd.concat(part).reset_index(drop=True) for part in parts)
 
 
+def fit_iqr_thresholds(
+    train_df: pd.DataFrame,
+    target_cols: Sequence[str],
+    multiplier: float = 1.5,
+) -> pd.DataFrame:
+    """학습 구간에서 설비·변수별 Tukey IQR 경계를 계산한다.
+
+    Q1/Q3와 경계는 반드시 시간순으로 분리한 학습 데이터에서만 계산한다. 결측치는
+    분위수 계산에서 제외하고, IQR이 0인 거의 일정한 변수는 이후 마스킹 대상에서
+    제외한다. 이 동작은 GitHub Cement의 ``remove_iqr_outliers``와 동일한 규칙이다.
+    """
+    if multiplier <= 0:
+        raise ValueError("IQR multiplier는 0보다 커야 합니다.")
+    source_df = train_df
+    validate_hourly_frame(source_df)
+    rows: list[dict] = []
+    for item_id, group in source_df.groupby("item_id", sort=False):
+        for column in target_cols:
+            values = pd.to_numeric(group[column], errors="coerce").dropna()
+            if values.empty:
+                q1 = q3 = iqr = low = high = np.nan
+            else:
+                q1, q3 = values.quantile([0.25, 0.75]).to_numpy(dtype=float)
+                iqr = float(q3 - q1)
+                low = float(q1 - multiplier * iqr)
+                high = float(q3 + multiplier * iqr)
+            rows.append(
+                {
+                    "item_id": item_id,
+                    "variable": column,
+                    "q1": q1,
+                    "q3": q3,
+                    "iqr": iqr,
+                    "multiplier": multiplier,
+                    "low_value": low,
+                    "high_value": high,
+                    "source_observed": int(len(values)),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def apply_iqr_thresholds(
+    df: pd.DataFrame,
+    thresholds: pd.DataFrame,
+    target_cols: Sequence[str],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """미리 계산한 설비·변수별 Tukey IQR 경계 밖의 값만 NaN으로 마스킹한다.
+
+    반환값은 (마스킹된 데이터, 설비·변수별 마스킹 개수 요약)이다. 이 함수 안에서는
+    경계를 다시 계산하지 않는다. IQR이 0이거나 유효한 경계가 없는 변수는 원본을
+    그대로 유지한다.
+    """
+    result = df.copy()
+    required = {"item_id", "variable", "iqr", "low_value", "high_value"}
+    missing = required.difference(thresholds.columns)
+    if missing:
+        raise KeyError(f"IQR threshold 열이 없습니다: {sorted(missing)}")
+
+    threshold_map = thresholds.set_index(["item_id", "variable"])[
+        ["iqr", "low_value", "high_value"]
+    ]
+    rows: list[dict] = []
+    for item_id, indices in result.groupby("item_id", sort=False).groups.items():
+        for column in target_cols:
+            key = (item_id, column)
+            if key not in threshold_map.index:
+                raise KeyError(f"IQR threshold가 없습니다: {key}")
+            iqr, low, high = threshold_map.loc[key].to_numpy(dtype=float)
+            values = pd.to_numeric(result.loc[indices, column], errors="coerce")
+            if np.isfinite(iqr) and iqr > 0 and np.isfinite(low) and np.isfinite(high):
+                mask = values.lt(low) | values.gt(high)
+            else:
+                mask = pd.Series(False, index=values.index)
+            result.loc[mask.index[mask], column] = np.nan
+            rows.append(
+                {
+                    "item_id": item_id,
+                    "variable": column,
+                    "iqr": iqr,
+                    "low_value": low,
+                    "high_value": high,
+                    "masked": int(mask.sum()),
+                }
+            )
+    return result, pd.DataFrame(rows)
+
+
 def validation_windows(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
@@ -388,8 +477,10 @@ def _prepared_input(
 ) -> dict:
     context = np.concatenate([target_context.T, past_covariates.T], axis=0).astype(np.float32)
     return {
-        "context": context,
-        "future_covariates": np.full((context.shape[0], prediction_length), np.nan, dtype=np.float32),
+        "context": torch.from_numpy(context),
+        "future_covariates": torch.full(
+            (context.shape[0], prediction_length), float("nan"), dtype=torch.float32
+        ),
         "n_targets": int(target_context.shape[1]),
         "n_covariates": int(past_covariates.shape[1]),
         "n_future_covariates": 0,
@@ -403,6 +494,7 @@ def rolling_forecast_multivariate(
     variable_scale: Sequence[float],
     is_down: np.ndarray,
     *,
+    actual_data: pd.DataFrame | None = None,
     context_length: int,
     prediction_length: int = 1,
     stride: int = 1,
@@ -411,10 +503,20 @@ def rolling_forecast_multivariate(
     quantile_high: float = 0.99,
     severity_eps: float = 1e-3,
 ) -> pd.DataFrame:
-    """물리 정리된 값으로 rolling 예측하고 같은 정리된 실측값으로 채점한다."""
+    """정리된 입력으로 rolling 예측하고 별도로 지정한 실측값으로 채점한다.
+
+    ``actual_data``를 생략하면 ``data``로 입력과 채점을 모두 수행한다. 별도 데이터를 넘기면
+    모델 입력과 실제 채점값의 시간축은 유지하면서 서로 다른 마스킹 정책을 적용할 수 있다.
+    """
     if prediction_length != 1:
         raise ValueError("현재 review_v2 공정 파이프라인은 prediction_length=1로 고정합니다.")
     targets = data[list(target_cols)].to_numpy(dtype=np.float32)
+    if actual_data is None:
+        actual_targets = targets
+    else:
+        if len(actual_data) != len(data):
+            raise ValueError("data와 actual_data의 행 수가 다릅니다.")
+        actual_targets = actual_data[list(target_cols)].to_numpy(dtype=np.float32)
     covariates = data[[DOWNTIME_COL]].to_numpy(dtype=np.float32)
     n = len(data)
     positions = list(range(context_length, n, stride))
@@ -447,7 +549,7 @@ def rolling_forecast_multivariate(
         for batch_index, target_index in enumerate(batch_pos):
             forecast = forecasts[batch_index].detach().to("cpu").float().numpy()
             for variable_index, column in enumerate(target_cols):
-                actual = float(targets[target_index, variable_index])
+                actual = float(actual_targets[target_index, variable_index])
                 q_low = float(forecast[variable_index, low_i, 0])
                 q_mid = float(forecast[variable_index, mid_i, 0])
                 q_high = float(forecast[variable_index, high_i, 0])
@@ -520,4 +622,3 @@ def runtime_versions(packages: Iterable[str] | None = None) -> dict:
         except PackageNotFoundError:
             result[package] = None
     return result
-

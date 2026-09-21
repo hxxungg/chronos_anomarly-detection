@@ -8,8 +8,15 @@ __pycache__/
 
 # 데이터 파일 (실제 공장 데이터 - 저장소에 올리지 않음)
 *.xlsx
+*.XLSX
 *.xls
+*.XLS
+*.xlsm
+*.XLSM
+*.xlsb
+*.XLSB
 *.csv
+*.CSV
 ~$*
 
 # 노트북 실행 결과물
